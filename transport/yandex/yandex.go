@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,12 +36,13 @@ type YandexDocsInfo struct {
 }
 
 type DocSession struct {
-	Info       YandexDocsInfo
-	Conn       *websocket.Conn
-	WriteQueue chan []byte
-	UserID     string
-	writeMu    sync.Mutex
-	Alive      atomic.Bool
+	Info                 YandexDocsInfo
+	Conn                 *websocket.Conn
+	WriteQueue           chan []byte
+	UserID               string
+	writeMu              sync.Mutex
+	Alive                atomic.Bool
+	LastDisconnectReason atomic.Int32
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
@@ -123,42 +125,26 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	n := len(sessions)
 	if n == 0 {
 		t.RecordError()
-		return fmt.Errorf("no sessions available")
+		return fmt.Errorf("no sessions")
 	}
 
-	// Retry with short backoff if all queues are full
-	maxRetries := 3
-	for retry := 0; retry < maxRetries; retry++ {
-		// Round-Robin across alive sessions
-		start := int(t.rrCounter.Add(1)) % n
-		for i := 0; i < n; i++ {
-			idx := (start + i) % n
-			sess := sessions[idx]
-			if sess == nil || sess.Conn == nil || !sess.Alive.Load() {
-				continue
-			}
-			select {
-			case sess.WriteQueue <- data:
-				t.RecordSend(len(data))
-				return nil
-			default:
-				// Queue full, try next session
-			}
+	start := int(t.rrCounter.Add(1)) % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		sess := sessions[idx]
+		if sess == nil || sess.Conn == nil || !sess.Alive.Load() {
+			continue
 		}
-		
-		// All queues full, wait a bit before retry
-		if retry < maxRetries-1 {
-			time.Sleep(time.Duration(retry+1) * 10 * time.Millisecond)
-			// Re-read sessions snapshot in case state changed
-			t.sessionMu.RLock()
-			sessions = t.sessions
-			t.sessionMu.RUnlock()
+		select {
+		case sess.WriteQueue <- data:
+			t.RecordSend(len(data))
+			return nil
+		default:
+			// Очередь полна — пробуем следующую
 		}
 	}
-	
-	utils.Debugf("[YDOCS] Send failed: all write queues full after %d retries", maxRetries)
 	t.RecordError()
-	return fmt.Errorf("all write queues full or no alive sessions after %d retries", maxRetries)
+	return fmt.Errorf("all write queues full")
 }
 
 func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt int) {
@@ -306,14 +292,15 @@ func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt 
 // updateConnectedStatus sets the connected flag based on alive sessions.
 // Must be called with sessionMu held.
 func (t *YandexDocsTransport) updateConnectedStatus() {
-	anyAlive := false
+	aliveCount := 0
+	total := len(t.sessions)
 	for _, s := range t.sessions {
 		if s != nil && s.Alive.Load() {
-			anyAlive = true
-			break
+			aliveCount++
 		}
 	}
-	t.SetConnected(anyAlive)
+	t.SetConnected(aliveCount > 0)
+	utils.Debugf("[YDOCS] alive sessions: %d/%d", aliveCount, total)
 }
 
 func (t *YandexDocsTransport) writerLoopForIndex(idx int) {
@@ -377,13 +364,11 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 
 			for idx, session := range sessions {
 				if session != nil && session.Conn != nil && session.Alive.Load() {
-					if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-						utils.Debugf("[YDOCS][%d] Keep-alive failed: %v", idx, err)
-						session.Alive.Store(false)
-						t.sessionMu.Lock()
-						t.updateConnectedStatus()
-						t.sessionMu.Unlock()
-						t.RecordError()
+					// Отправка через WriteQueue, чтобы не конкурировать с writerLoop
+					select {
+					case session.WriteQueue <- []byte(keepAliveMsg):
+					default:
+						// Очередь полна — пропускаем keep-alive
 					}
 				}
 			}
@@ -394,18 +379,38 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	if strings.Contains(text, "---KA---") {
+	// Проверка: session должна быть живой
+	if session == nil || !session.Alive.Load() {
 		return
 	}
 
 	// Socket.IO ping - respond with pong (use safeWrite)
 	if text == "2" {
-		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
-		}
+		session.safeWrite(websocket.TextMessage, []byte("3"))
 		return
 	}
 	if text == "3" {
+		return
+	}
+
+	// Обработка disconnectReason от Яндекса (бан сессии)
+	if strings.Contains(text, "disconnectReason") {
+		re := regexp.MustCompile(`"disconnectReason":\s*(\d+)`)
+		matches := re.FindStringSubmatch(text)
+		if len(matches) > 1 {
+			if reason, err := strconv.Atoi(matches[1]); err == nil {
+				session.LastDisconnectReason.Store(int32(reason))
+				utils.Debugf("[YDOCS][%s] disconnect reason: %d", session.UserID, reason)
+				// 4007 = drop/ban — увеличим backoff через флаг
+				if reason == 4007 {
+					utils.Debugf("[YDOCS][%s] session banned (4007), will use extended backoff", session.UserID)
+				}
+			}
+		}
+		return
+	}
+
+	if strings.Contains(text, "---KA---") {
 		return
 	}
 
@@ -417,7 +422,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 
 		decoded, err := base64.StdEncoding.DecodeString(base64Str)
 		if err != nil {
-			utils.Debugf("[YDOCS] Base64 decode error: %v", err)
+			utils.Debugf("[YDOCS][%s] Base64 decode error: %v", session.UserID, err)
 			return
 		}
 
@@ -457,6 +462,19 @@ func (t *YandexDocsTransport) scheduleReconnectForIndex(idx int, url string, att
 	// Back off before retrying so a server that closes us immediately doesn't
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
+	
+	// Проверяем, был ли бан (4007) — увеличиваем backoff
+	t.sessionMu.RLock()
+	session := t.sessions[idx]
+	t.sessionMu.RUnlock()
+	if session != nil && session.LastDisconnectReason.Load() == 4007 {
+		d *= 2
+		if d > 5*time.Minute {
+			d = 5 * time.Minute
+		}
+		utils.Debugf("[YDOCS][%d] banned session, extended backoff: %v (attempt %d)", idx, d, next)
+	}
+
 	utils.Debugf("[YDOCS][%d] reconnecting in %v (attempt %d)", idx, d, next)
 	
 	// Use select with context for interruptible sleep

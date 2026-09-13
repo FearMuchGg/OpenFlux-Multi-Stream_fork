@@ -9,7 +9,6 @@
 - [Исправленные проблемы](#исправленные-проблемы)
 - [Мониторинг](#мониторинг)
 - [Troubleshooting](#troubleshooting)
-- [Этапы внедрения](#этапы-внедрения)
 
 ---
 
@@ -698,31 +697,43 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 #### 4. Ошибка "all write queues full"
 
 **Проблема:**
-При переполнении всех очередей функция просто возвращала ошибку. Кто её обрабатывает?
+При переполнении всех очередей блокирующий `time.Sleep` в retry цикле тормозил весь туннель.
 
 **Решение:**
+Убран блокирующий retry со sleep. Один неблокирующий проход:
 ```go
 func (t *YandexDocsTransport) Send(data []byte) error {
-    const maxRetries = 3
-    backoffs := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 30 * time.Millisecond}
+    t.sessionMu.RLock()
+    sessions := t.sessions
+    t.sessionMu.RUnlock()
     
-    for retry := 0; retry < maxRetries; retry++ {
-        // ... попытка отправки ...
-        
-        if success {
-            return nil
-        }
-        
-        if retry < maxRetries-1 {
-            time.Sleep(backoffs[retry])
-        }
+    n := len(sessions)
+    if n == 0 {
+        t.RecordError()
+        return fmt.Errorf("no sessions")
     }
     
-    log.Printf("[YDOCS] failed to send after %d retries: all write queues full", maxRetries)
+    start := int(t.rrCounter.Add(1)) % n
+    for i := 0; i < n; i++ {
+        idx := (start + i) % n
+        sess := sessions[idx]
+        if sess == nil || sess.Conn == nil || !sess.Alive.Load() {
+            continue
+        }
+        select {
+        case sess.WriteQueue <- data:
+            t.RecordSend(len(data))
+            return nil
+        default:
+            // Очередь полна — пробуем следующую
+        }
+    }
     t.RecordError()
-    return fmt.Errorf("all write queues full after %d retries", maxRetries)
+    return fmt.Errorf("all write queues full")
 }
 ```
+
+Если все очереди полны — сразу возвращаем ошибку, не блокируя Send().
 
 #### 5. RecordSend только при успехе
 
@@ -1015,41 +1026,6 @@ Read at 0x00c0001a4020 by goroutine 8:
 # Проверить горутины
 curl http://localhost:6060/debug/pprof/goroutine?debug=2
 ```
-
----
-
-## Этапы внедрения
-
-### Этап 1: MVP (текущий)
-
-✅ **Реализовано:**
-- 2-3 документа
-- Простой Round-Robin
-- Базовое восстановление слотов
-- Измерение RTT (логирование)
-- Защита от race conditions
-- Graceful shutdown
-
-### Этап 2: Улучшенное восстановление
-
-🔲 **Планируется:**
-- Fast-fail: если сессия не отвечает 3 раза подряд → пометить как "проблемную"
-- Автовосстановление: пересоздание "проблемных" сессий с новым URL
-- Метрики по каждой сессии отдельно
-
-### Этап 3: Weighted Round-Robin
-
-🔲 **Планируется:**
-- Использовать RTT для взвешивания
-- Медленные сессии получают меньше трафика
-- Автоматическая балансировка по качеству каналов
-
-### Этап 4: Расширение на другие транспорты
-
-🔲 **Планируется:**
-- Применить multi-stream к `oneme` (MAX)
-- Применить multi-stream к `cupsonline`
-- Унифицировать интерфейс
 
 ---
 
