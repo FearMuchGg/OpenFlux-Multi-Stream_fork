@@ -3,7 +3,6 @@ package yandex
 import (
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,41 +20,6 @@ import (
 
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
-)
-
-// =====================================================================
-// OFSP v1 (OpenFlux Stream Protocol) — thin envelope over raw IP packets
-// that gives us reliable multi-stream delivery:
-//
-//   [0]      magic   0xFF       (never a valid IP version nibble)
-//   [1]      version 0x01
-//   [2]      flags   bit0=needs-ACK, bit1=is-ACK,
-//                    bit2=critical, bit3=keep-alive
-//   [3..10]  seq     uint64 big-endian
-//   [11..]   payload (raw IP packet, or empty for ACK/keep-alive)
-//
-// Sender assigns a seq to each outbound packet, stores it in a pending
-// map, and retransmits if no ACK arrives before RTO. Receiver deduplicates
-// by seq and sends back ACK envelopes. Critical TCP packets (SYN/FIN/RST)
-// are additionally sent to 2 distinct alive sessions for redundancy.
-// =====================================================================
-
-const (
-	envMagic   byte = 0xFF
-	envVersion byte = 0x01
-	envHdrLen       = 11 // magic + version + flags + seq(8)
-
-	flagNeedsACK  byte = 0x01
-	flagIsACK     byte = 0x02
-	flagCritical  byte = 0x04
-	flagKeepAlive byte = 0x08
-
-	maxRetransmitAttempts = 8
-	initialRTO            = 300 * time.Millisecond
-	maxRTO                = 3 * time.Second
-	retransmitTick        = 100 * time.Millisecond
-	dedupTTL              = 30 * time.Second
-	dedupCleanupTick      = 10 * time.Second
 )
 
 type YandexDocsInfo struct {
@@ -113,11 +77,6 @@ type YandexDocsTransport struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
-
-	// OFSP: seq + pending + inbound dedup
-	seqCounter   atomic.Uint64
-	pending      sync.Map // uint64 -> *pendingEntry (outbound, awaiting ACK)
-	receivedSeqs sync.Map // uint64 -> *dedupEntry  (inbound, dedup)
 }
 
 func NewYandexDocsTransport(urls []string, config transport.TransportConfig) *YandexDocsTransport {
@@ -147,20 +106,6 @@ func (t *YandexDocsTransport) Start() error {
 		t.keepAliveLoop()
 	})
 
-	// OFSP: retransmit unacked packets
-	t.wg.Add(1)
-	utils.SafeGo("yandex.retransmit", func() {
-		defer t.wg.Done()
-		t.retransmitLoop()
-	})
-
-	// OFSP: evict stale dedup entries
-	t.wg.Add(1)
-	utils.SafeGo("yandex.dedupCleaner", func() {
-		defer t.wg.Done()
-		t.dedupCleanupLoop()
-	})
-
 	// One connection per document
 	for i, docUrl := range t.urls {
 		t.wg.Add(1)
@@ -181,46 +126,13 @@ func (t *YandexDocsTransport) Stop() error {
 	return t.BaseTransport.Stop()
 }
 
-// ---------------------------------------------------------------------
-// Send — public entry point.
-//
-// If `data` is a raw IP packet, it gets wrapped in an OFSP envelope,
-// registered in the pending map, and routed to an alive session.
-// If `data` is already an envelope (ACK / retransmit / requeue from
-// writerLoop), it's routed as-is without re-wrapping.
-//
-// Critical TCP packets (SYN/FIN/RST) are sent to 2 distinct sessions.
-// ---------------------------------------------------------------------
+// Send sends data through one of the alive sessions using Round-Robin.
 func (t *YandexDocsTransport) Send(data []byte) error {
 	if !t.IsConnected() {
 		t.RecordError()
 		return fmt.Errorf("transport not connected")
 	}
 
-	// Already wrapped (ACK, retransmit, requeue): route as-is.
-	if isEnvelope(data) {
-		return t.sendEnvelope(data)
-	}
-
-	// Wrap raw IP packet.
-	critical := isCriticalPacket(data)
-	env := t.wrapPacket(data, critical)
-
-	seq := binary.BigEndian.Uint64(env[3:11])
-	t.pending.Store(seq, &pendingEntry{
-		envelope: env,
-		sentAt:   time.Now(),
-		attempts: 0,
-		critical: critical,
-	})
-
-	return t.sendEnvelope(env)
-}
-
-// sendEnvelope routes an already-wrapped envelope to one (or two, for
-// critical) alive session's WriteQueue. Non-blocking: returns error
-// immediately if every queue is full.
-func (t *YandexDocsTransport) sendEnvelope(env []byte) error {
 	t.sessionMu.RLock()
 	sessions := t.sessions
 	t.sessionMu.RUnlock()
@@ -231,144 +143,24 @@ func (t *YandexDocsTransport) sendEnvelope(env []byte) error {
 		return fmt.Errorf("no sessions")
 	}
 
-	var flags byte
-	if len(env) > 2 {
-		flags = env[2]
-	}
-	critical := flags&flagCritical != 0
-	isACK := flags&flagIsACK != 0
-
-	needed := 1
-	if critical {
-		needed = 2
-	}
-	if n < needed {
-		needed = n
-	}
-
-	sent := 0
 	start := int(t.rrCounter.Add(1)) % n
-	for i := 0; i < n && sent < needed; i++ {
+	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		sess := sessions[idx]
 		if sess == nil || sess.Conn == nil || !sess.Alive.Load() {
 			continue
 		}
 		select {
-		case sess.WriteQueue <- env:
-			t.RecordSend(len(env))
-			sent++
+		case sess.WriteQueue <- data:
+			t.RecordSend(len(data))
+			return nil
 		default:
 			// queue full, try next
 		}
 	}
 
-	if sent == 0 {
-		t.RecordError()
-		return fmt.Errorf("all write queues full")
-	}
-	if critical && sent < 2 && !isACK {
-		utils.Debugf("[YDOCS] critical packet partial redundancy: %d/2", sent)
-	}
-	return nil
-}
-
-func isEnvelope(data []byte) bool {
-	return len(data) >= envHdrLen && data[0] == envMagic && data[1] == envVersion
-}
-
-// wrapPacket creates an OFSP envelope around a raw IP packet.
-func (t *YandexDocsTransport) wrapPacket(data []byte, critical bool) []byte {
-	seq := t.seqCounter.Add(1)
-	flags := flagNeedsACK
-	if critical {
-		flags |= flagCritical
-	}
-	env := make([]byte, envHdrLen+len(data))
-	env[0] = envMagic
-	env[1] = envVersion
-	env[2] = flags
-	binary.BigEndian.PutUint64(env[3:11], seq)
-	copy(env[envHdrLen:], data)
-	return env
-}
-
-// wrapACK builds an ACK envelope for the given inbound sequence number.
-func (t *YandexDocsTransport) wrapACK(seq uint64) []byte {
-	env := make([]byte, envHdrLen)
-	env[0] = envMagic
-	env[1] = envVersion
-	env[2] = flagIsACK
-	binary.BigEndian.PutUint64(env[3:11], seq)
-	return env
-}
-
-// wrapKeepAlive builds a keep-alive envelope (no payload, needs-ACK).
-func (t *YandexDocsTransport) wrapKeepAlive() []byte {
-	env := make([]byte, envHdrLen)
-	env[0] = envMagic
-	env[1] = envVersion
-	env[2] = flagNeedsACK | flagKeepAlive
-	binary.BigEndian.PutUint64(env[3:11], t.seqCounter.Add(1))
-	return env
-}
-
-// isCriticalPacket returns true iff `data` is an IPv4 or IPv6 packet
-// whose TCP segment has SYN, FIN, or RST set. These are sent redundantly.
-func isCriticalPacket(data []byte) bool {
-	if len(data) < 20 {
-		return false
-	}
-	version := data[0] >> 4
-	var proto byte
-	var payloadStart int
-
-	switch version {
-	case 4:
-		ihl := int(data[0]&0x0F) * 4
-		if ihl < 20 || len(data) < ihl {
-			return false
-		}
-		proto = data[9]
-		payloadStart = ihl
-	case 6:
-		if len(data) < 40 {
-			return false
-		}
-		nextHeader := data[6]
-		payloadStart = 40
-	walkV6:
-		for {
-			switch nextHeader {
-			case 0, 43, 44, 60: // hop-by-hop, routing, fragment, dst opts
-				if len(data) < payloadStart+8 {
-					return false
-				}
-				nextHeader = data[payloadStart]
-				extLen := int(data[payloadStart+1])*8 + 8
-				if extLen < 8 {
-					return false
-				}
-				payloadStart += extLen
-			case 6, 17, 1, 58: // TCP, UDP, ICMP, ICMPv6
-				proto = nextHeader
-				break walkV6
-			default:
-				break walkV6
-			}
-		}
-	default:
-		return false
-	}
-
-	if proto != 6 { // TCP
-		return false
-	}
-	if len(data) < payloadStart+14 {
-		return false
-	}
-	const fin, syn, rst = 0x01, 0x02, 0x04
-	return data[payloadStart+13]&(fin|syn|rst) != 0
+	t.RecordError()
+	return fmt.Errorf("all write queues full")
 }
 
 func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt int) {
@@ -521,8 +313,7 @@ func (t *YandexDocsTransport) updateConnectedStatus() {
 }
 
 // drainDeadSession pulls any still-queued packets from a session that
-// just died and reroutes them via sendEnvelope to an alive session.
-// Prevents silent loss of packets that were queued but not yet written.
+// just died and reroutes them via Send to an alive session.
 func (t *YandexDocsTransport) drainDeadSession(deadIdx int) {
 	t.sessionMu.RLock()
 	deadSess := t.sessions[deadIdx]
@@ -536,8 +327,8 @@ func (t *YandexDocsTransport) drainDeadSession(deadIdx int) {
 	for {
 		select {
 		case packet := <-deadSess.WriteQueue:
-			time.Sleep(2 * time.Millisecond) // let other sessions settle
-			if err := t.sendEnvelope(packet); err != nil {
+			time.Sleep(2 * time.Millisecond)
+			if err := t.Send(packet); err != nil {
 				utils.Debugf("[YDOCS] drain[%d]: reroute failed: %v", deadIdx, err)
 			}
 			drained++
@@ -584,18 +375,14 @@ func (t *YandexDocsTransport) writerLoopForIndex(idx int) {
 				t.sessionMu.Unlock()
 				t.RecordError()
 
-				// Phase 1: the packet we just pulled from the queue was
-				// NOT sent — reroute it to another alive session via
-				// sendEnvelope (which detects already-wrapped envelope
-				// and skips re-wrapping).
+				// Reroute the packet we just pulled from the queue
 				go func(p []byte) {
 					time.Sleep(5 * time.Millisecond)
-					if err := t.sendEnvelope(p); err != nil {
+					if err := t.Send(p); err != nil {
 						utils.Debugf("[YDOCS][%d] requeue failed: %v", idx, err)
 					}
 				}(packet)
 
-				// And drain any further queued packets for this dead session.
 				go t.drainDeadSession(idx)
 			} else {
 				rtt := time.Since(start)
@@ -626,11 +413,9 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 
 			for _, session := range sessions {
 				if session != nil && session.Conn != nil && session.Alive.Load() {
-					// OFSP keep-alive: an envelope with no payload. The
-					// receiver ACKs it, giving us free per-session RTT
-					// visibility for future weighted Round-Robin.
+					// Simple keep-alive marker
 					select {
-					case session.WriteQueue <- t.wrapKeepAlive():
+					case session.WriteQueue <- []byte("---KA---"):
 					default:
 					}
 				}
@@ -639,82 +424,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 	}
 }
 
-// ---------------------------------------------------------------------
-// OFSP: retransmit loop
-// ---------------------------------------------------------------------
 
-// retransmitLoop scans the pending map every 100ms and retransmits any
-// packet that hasn't been ACKed within its (exponentially growing) RTO.
-// After maxRetransmitAttempts (8) the packet is dropped and counted as
-// an error — the upper-layer TCP stack will recover from the loss.
-func (t *YandexDocsTransport) retransmitLoop() {
-	ticker := time.NewTicker(retransmitTick)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-t.ctx.Done():
-			return
-		case now := <-ticker.C:
-			t.pending.Range(func(key, value interface{}) bool {
-				seq := key.(uint64)
-				entry := value.(*pendingEntry)
-
-				entry.mu.Lock()
-				defer entry.mu.Unlock()
-
-				age := now.Sub(entry.sentAt)
-				rto := initialRTO * time.Duration(1<<uint(entry.attempts))
-				if rto > maxRTO {
-					rto = maxRTO
-				}
-				if age < rto {
-					return true
-				}
-
-				if entry.attempts >= maxRetransmitAttempts {
-					utils.Debugf("[YDOCS] dropping packet seq=%d after %d attempts",
-						seq, entry.attempts)
-					t.pending.Delete(seq)
-					t.RecordError()
-					return true
-				}
-
-				if err := t.sendEnvelope(entry.envelope); err != nil {
-					utils.Debugf("[YDOCS] retransmit seq=%d failed: %v", seq, err)
-					t.pending.Delete(seq)
-					t.RecordError()
-					return true
-				}
-				entry.attempts++
-				entry.sentAt = now
-				utils.Debugf("[YDOCS] retransmit seq=%d attempt=%d", seq, entry.attempts)
-				return true
-			})
-		}
-	}
-}
-
-// dedupCleanupLoop evicts stale entries from the inbound dedup map.
-func (t *YandexDocsTransport) dedupCleanupLoop() {
-	ticker := time.NewTicker(dedupCleanupTick)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-t.ctx.Done():
-			return
-		case now := <-ticker.C:
-			t.receivedSeqs.Range(func(key, value interface{}) bool {
-				e := value.(*dedupEntry)
-				if now.Sub(e.seenAt) > dedupTTL {
-					t.receivedSeqs.Delete(key)
-				}
-				return true
-			})
-		}
-	}
-}
 
 // ---------------------------------------------------------------------
 // Inbound handling
@@ -753,7 +463,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	// Legacy keep-alive marker (from older peers without OFSP)
+	// Keep-alive marker
 	if strings.Contains(text, "---KA---") {
 		return
 	}
@@ -770,64 +480,13 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			return
 		}
 
-		// OFSP envelope? Parse flags, dedup, ACK, deliver payload.
-		if isEnvelope(decoded) {
-			t.handleEnvelope(session, decoded)
-			return
-		}
-
-		// Legacy: raw IP packet (older peer). Pass through unchanged.
+		// Pass through to upper layers (OFSP/Batched will handle it)
 		t.RecordReceive(len(decoded))
 		t.CallReceive(decoded)
 	}
 }
 
-// handleEnvelope processes an inbound OFSP envelope:
-//   - is-ACK  → remove matching outbound entry from pending
-//   - dedup   → drop already-seen non-ACK seqs (still send ACK though)
-//   - keep-alive → drop payload, just a liveness probe
-//   - otherwise  → deliver payload (raw IP packet) to the tunnel
-func (t *YandexDocsTransport) handleEnvelope(session *DocSession, env []byte) {
-	if len(env) < envHdrLen {
-		return
-	}
-	flags := env[2]
-	seq := binary.BigEndian.Uint64(env[3:11])
-	payload := env[envHdrLen:]
 
-	// Inbound ACK: drop matching pending entry.
-	if flags&flagIsACK != 0 {
-		t.pending.Delete(seq)
-		return
-	}
-
-	// Dedup check for inbound data packets.
-	entry := &dedupEntry{seenAt: time.Now()}
-	if _, loaded := t.receivedSeqs.LoadOrStore(seq, entry); loaded {
-		// Duplicate. The sender likely missed our first ACK, so resend it.
-		if flags&flagNeedsACK != 0 {
-			_ = t.sendEnvelope(t.wrapACK(seq))
-		}
-		return
-	}
-
-	// Send ACK synchronously (sendEnvelope is non-blocking; if all
-	// queues are full we simply lose the ACK and the sender will
-	// retransmit, which we'll dedup).
-	if flags&flagNeedsACK != 0 {
-		_ = t.sendEnvelope(t.wrapACK(seq))
-	}
-
-	// Keep-alive: no payload, just a liveness probe. Count as receive.
-	if flags&flagKeepAlive != 0 {
-		t.RecordReceive(len(env))
-		return
-	}
-
-	// Real data: deliver the raw IP packet to the tunnel.
-	t.RecordReceive(len(payload))
-	t.CallReceive(payload)
-}
 
 func (t *YandexDocsTransport) extractBase64String(response string) string {
 	if strings.Contains(response, "saveChanges") {

@@ -151,7 +151,17 @@ func main() {
 		log.Printf("Transport encryption: AES-256-GCM enabled")
 	}
 
-	trans := transport.NewCompressedTransport(inner)
+	// Wrap with OFSP (reliability) and Batched (coalescing) layers
+	// unless --legacy flag is set
+	var trans transport.Transport
+	if *legacy {
+		log.Printf("Codec: legacy (per-packet compression only)")
+		trans = transport.NewCompressedTransport(inner)
+	} else {
+		log.Printf("Codec: OFSP + Batched (reliable + coalescing + compression)")
+		ofspTransport := transport.NewOFSPTransport(inner)
+		trans = transport.NewBatchedTransport(ofspTransport)
+	}
 
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
