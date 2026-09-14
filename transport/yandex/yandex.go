@@ -84,14 +84,14 @@ func (t *YandexDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
-	
+
 	// Start keep-alive loop with WaitGroup tracking
 	t.wg.Add(1)
 	utils.SafeGo("yandex.keepAlive", func() {
 		defer t.wg.Done()
 		t.keepAliveLoop()
 	})
-	
+
 	// Launch parallel connections for each document URL
 	for i, docUrl := range t.urls {
 		t.wg.Add(1)
@@ -159,14 +159,14 @@ func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt 
 			utils.Debugf("[PANIC] recovered in yandex.connect[%d]: %v", idx, r)
 		}
 	}()
-	
+
 	// Check context before starting connection attempt
 	select {
 	case <-t.ctx.Done():
 		return
 	default:
 	}
-	
+
 	t.sessionMu.RLock()
 	existingSession := t.sessions[idx]
 	t.sessionMu.RUnlock()
@@ -265,7 +265,7 @@ func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt 
 			return
 		default:
 		}
-		
+
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			utils.Debugf("[YDOCS][%d] Read error: %v", idx, err)
@@ -274,7 +274,7 @@ func (t *YandexDocsTransport) connectToDocForIndex(idx int, url string, attempt 
 			t.updateConnectedStatus()
 			t.sessionMu.Unlock()
 			t.RecordError()
-			
+
 			// If the session was healthy for a while, treat the next
 			// connect as fresh (attempt -1 -> next attempt 0) so backoff
 			// doesn't keep growing across normal long-lived reconnects.
@@ -310,7 +310,7 @@ func (t *YandexDocsTransport) writerLoopForIndex(idx int) {
 			return
 		default:
 		}
-		
+
 		t.sessionMu.RLock()
 		session := t.sessions[idx]
 		t.sessionMu.RUnlock()
@@ -362,7 +362,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 			sessions := t.sessions
 			t.sessionMu.RUnlock()
 
-			for idx, session := range sessions {
+			for _, session := range sessions {
 				if session != nil && session.Conn != nil && session.Alive.Load() {
 					// Отправка через WriteQueue, чтобы не конкурировать с writerLoop
 					select {
@@ -462,7 +462,7 @@ func (t *YandexDocsTransport) scheduleReconnectForIndex(idx int, url string, att
 	// Back off before retrying so a server that closes us immediately doesn't
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
-	
+
 	// Проверяем, был ли бан (4007) — увеличиваем backoff
 	t.sessionMu.RLock()
 	session := t.sessions[idx]
@@ -476,14 +476,14 @@ func (t *YandexDocsTransport) scheduleReconnectForIndex(idx int, url string, att
 	}
 
 	utils.Debugf("[YDOCS][%d] reconnecting in %v (attempt %d)", idx, d, next)
-	
+
 	// Use select with context for interruptible sleep
 	select {
 	case <-time.After(d):
 	case <-t.ctx.Done():
 		return
 	}
-	
+
 	if !t.IsRunning() {
 		return
 	}
