@@ -105,16 +105,44 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 	return aead, nil
 }
 
-func (e *EncryptedTransport) Send(data []byte) error {
+// seal wraps one plaintext frame into a self-contained encrypted packet: magic,
+// version, direction byte, random nonce, then the AEAD ciphertext.
+func (e *EncryptedTransport) seal(data []byte) ([]byte, error) {
 	header := []byte{encryptedMagic[0], encryptedMagic[1], encryptedMagic[2], encryptedVersion, e.sendDirection}
 	nonce := make([]byte, e.sendAEAD.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("create packet nonce: %w", err)
+		return nil, fmt.Errorf("create packet nonce: %w", err)
 	}
 	packet := make([]byte, 0, len(header)+len(nonce)+len(data)+e.sendAEAD.Overhead())
 	packet = append(packet, header...)
 	packet = append(packet, nonce...)
 	packet = e.sendAEAD.Seal(packet, nonce, data, header)
+	return packet, nil
+}
+
+func (e *EncryptedTransport) Send(data []byte) error {
+	packet, err := e.seal(data)
+	if err != nil {
+		return err
+	}
+	return e.Transport.Send(packet)
+}
+
+// SendFlow encrypts exactly like Send, then forwards the inner flow identity
+// down the chain so MultiStreamTransport can pin a connection to one document.
+//
+// Encryption stays a single shared instance above MultiStream — one replay
+// window for the whole tunnel. Giving each stream its own EncryptedTransport
+// would let the same ciphertext be replayed onto a different document and
+// accepted there, because each stream's window would be separate.
+func (e *EncryptedTransport) SendFlow(key FlowKey, data []byte) error {
+	packet, err := e.seal(data)
+	if err != nil {
+		return err
+	}
+	if inner, ok := e.Transport.(FlowAwareSender); ok {
+		return inner.SendFlow(key, packet)
+	}
 	return e.Transport.Send(packet)
 }
 

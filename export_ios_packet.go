@@ -22,7 +22,6 @@ import (
 	"universal-bypass-tool/network"
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/oneme"
-	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/utils"
 )
 
@@ -48,6 +47,12 @@ var (
 	ptCancel context.CancelFunc
 )
 
+// OpenFluxStartPacketTunnel starts the system-wide tunnel (NEPacketTunnelProvider).
+//
+// transportType: "yandex", "vyandex" or "oneme".
+// url:           Yandex document URL(s). Comma-separated for multi-stream, the
+// same as the desktop client and the in-app SOCKS5 bridge.
+//
 //export OpenFluxStartPacketTunnel
 func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc C.int) {
 	tt := C.GoString(transportType)
@@ -73,16 +78,23 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	debug.SetGCPercent(20)
 
 	config := transport.DefaultConfig()
-	var t transport.Transport
+	// The Network Extension runs under a hard memory cap, so keep the
+	// multi-stream retry buffer well below the desktop default.
+	config.MultiStreamBufferBytes = 2 << 20
+	config.MultiStreamMaxPackets = 1024
+	var inner transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		inner = buildYandexInner(splitURLs(docURL), config, false)
+	case "vyandex":
+		inner = buildYandexInner(splitURLs(docURL), config, true)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		inner = oneme.NewOneMeTransport(false, mToken, uidint, config)
 	default:
 		return C.int(startBadTransport)
 	}
+	var t transport.Transport = transport.NewCompressedTransport(inner)
 
 	outQ := make(chan []byte, 1024)
 	// Packets coming back from the exit node -> queue for the device.
@@ -173,8 +185,8 @@ func sendICMPPortUnreachable(orig []byte, outQ chan []byte) {
 	ip := make([]byte, total)
 	ip[0] = 0x45
 	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
-	ip[8] = 64 // TTL
-	ip[9] = 1  // ICMP
+	ip[8] = 64                   // TTL
+	ip[9] = 1                    // ICMP
 	copy(ip[12:16], orig[16:20]) // src = original destination
 	copy(ip[16:20], orig[12:16]) // dst = original source (the device)
 	ck2 := network.IPChecksum(ip[:20])
@@ -266,8 +278,8 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 	resp[0] = req[0]
 	resp[1] = req[1]
 	binary.BigEndian.PutUint16(resp[2:4], uint16(total))
-	resp[8] = 64 // TTL
-	resp[9] = 17 // UDP
+	resp[8] = 64              // TTL
+	resp[9] = 17              // UDP
 	copy(resp[12:16], dstIP)  // src = original destination (the resolver)
 	copy(resp[16:20], srcIP)  // dst = the device
 	resp[10], resp[11] = 0, 0 // checksum field

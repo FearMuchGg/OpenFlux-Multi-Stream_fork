@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -421,10 +422,45 @@ func minInt(a, b int) int {
 	return b
 }
 
+// Liveness control actions. A bundle item whose actionName is one of these
+// carries no packet payload, so the peer can tell a probe from data by the
+// actionName alone (real data uses "textInsert"/"setCaret"). The nonce rides in
+// the item's id as "<action>:<nonce>".
+const (
+	probeAction = "ofx-ping"
+	pongAction  = "ofx-pong"
+
+	// relayFailStreak is how many consecutive relay POST failures retire a
+	// stream. One hiccup must not take a document out of rotation.
+	relayFailStreak = 3
+)
+
+// parseProbeNonce pulls the nonce out of a control item id.
+func parseProbeNonce(id string) (uint64, bool) {
+	i := strings.LastIndex(id, ":")
+	if i < 0 {
+		return 0, false
+	}
+	nonce, err := strconv.ParseUint(id[i+1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return nonce, true
+}
+
 type relayClient struct {
 	auth   *volgaAuth
 	config VolgaConfig
 	stats  *VolgaStats
+
+	// onState reports relay-level health: false after relayFailStreak
+	// consecutive POST failures, true again on the next success. Without it a
+	// document whose HTTP path died kept reporting IsConnected() == true
+	// forever, so MultiStream never stopped routing to it.
+	onState func(bool)
+
+	failStreak atomic.Int32
+	closed     atomic.Bool
 
 	httpClient *http.Client
 	workers    int
@@ -442,7 +478,7 @@ type relayClient struct {
 	frontier string
 }
 
-func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayClient {
+func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats, onState func(bool)) *relayClient {
 	tr := &http.Transport{
 		MaxIdleConns:        cfg.MaxIdleConns,
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
@@ -454,9 +490,10 @@ func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayC
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &relayClient{
-		auth:   auth,
-		config: cfg,
-		stats:  stats,
+		auth:    auth,
+		config:  cfg,
+		stats:   stats,
+		onState: onState,
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   cfg.RelayTimeout,
@@ -481,6 +518,7 @@ func (r *relayClient) Start() {
 
 func (r *relayClient) Stop() {
 	r.cancel()
+	r.closed.Store(true)
 	close(r.queue)
 	close(r.batchQueue)
 	r.wg.Wait()
@@ -489,6 +527,9 @@ func (r *relayClient) Stop() {
 func (r *relayClient) Send(data []byte) error {
 	if len(data) == 0 {
 		return nil
+	}
+	if r.closed.Load() {
+		return fmt.Errorf("relay client stopped")
 	}
 	if len(data) > r.config.MaxPayloadBytes {
 		return fmt.Errorf("packet too large: %d > %d", len(data), r.config.MaxPayloadBytes)
@@ -503,6 +544,28 @@ func (r *relayClient) Send(data []byte) error {
 	default:
 		r.stats.QueueDrops.Add(1)
 		return fmt.Errorf("queue full")
+	}
+}
+
+// noteResult tracks consecutive POST outcomes and flips relay health. A single
+// failure is noise; relayFailStreak in a row means the document's HTTP path is
+// gone and the stream should leave rotation.
+//
+// Only failures flip the state. A success deliberately does NOT re-admit the
+// stream: it proves our outbound path works, not that the peer's push channel
+// is back. Re-admission is left to the WS listener and the liveness probe.
+func (r *relayClient) noteResult(err error) {
+	if r.onState == nil {
+		return
+	}
+	if err == nil {
+		r.failStreak.Store(0)
+		return
+	}
+	if r.failStreak.Add(1) == relayFailStreak {
+		utils.Debugf("[VOLGA] relay POST failed %d times in a row, marking stream down: %v",
+			relayFailStreak, err)
+		r.onState(false)
 	}
 }
 
@@ -523,6 +586,7 @@ func (r *relayClient) worker(id int) {
 		}
 		r.stats.WorkerBusy.Add(1)
 		err := r.sendBatch(batch)
+		r.noteResult(err)
 		if err != nil {
 			r.stats.HTTPReqsFailed.Add(1)
 			utils.Debugf("[VOLGA] batch send failed: %v", err)
@@ -610,6 +674,36 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 		encoded,
 	}
 
+	if err := r.postBundle(bundle); err != nil {
+		return err
+	}
+
+	r.stats.PacketsSent.Add(uint64(len(batch)))
+	r.stats.PacketsBatched.Add(uint64(len(batch)))
+	r.stats.BytesSent.Add(uint64(totalBytes))
+	return nil
+}
+
+// sendProbe posts a liveness probe as a control bundle. A 2xx only proves our
+// own path to the document is alive; the peer's pong is what proves the far end
+// of the tunnel received it.
+func (r *relayClient) sendProbe(action string, nonce uint64) error {
+	bundle := []interface{}{
+		map[string]interface{}{
+			"id":         fmt.Sprintf("%s:%d", action, nonce),
+			"frontier":   r.getFrontier(),
+			"undoable":   false,
+			"actionName": action,
+			"ops":        []interface{}{},
+			"sideEffect": false,
+			"localId":    r.localID.Add(1),
+		},
+	}
+	return r.postBundle(bundle)
+}
+
+// postBundle wraps bundle in the relay envelope and POSTs it.
+func (r *relayClient) postBundle(bundle []interface{}) error {
 	payload := map[string]interface{}{
 		"message": map[string]interface{}{
 			"bundleId": r.bundleID.Add(1),
@@ -664,10 +758,6 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-
-	r.stats.PacketsSent.Add(uint64(len(batch)))
-	r.stats.PacketsBatched.Add(uint64(len(batch)))
-	r.stats.BytesSent.Add(uint64(totalBytes))
 	return nil
 }
 
@@ -693,22 +783,35 @@ type wsListener struct {
 	relay  *relayClient
 	onData func([]byte)
 
+	// live drives the end-to-end probe; onState reports WS-level health so a
+	// dropped push channel takes the stream out of rotation immediately
+	// instead of leaving IsConnected() true forever.
+	live    *transport.LivenessTracker
+	onState func(bool)
+
+	// badFrames counts received payloads that were not recognisable as tunnel
+	// frames, i.e. noise from the shared document.
+	badFrames atomic.Uint64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 func newWSListener(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats,
-	relay *relayClient, onData func([]byte)) *wsListener {
+	relay *relayClient, onData func([]byte), live *transport.LivenessTracker,
+	onState func(bool)) *wsListener {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &wsListener{
-		auth:   auth,
-		config: cfg,
-		stats:  stats,
-		relay:  relay,
-		onData: onData,
-		ctx:    ctx,
-		cancel: cancel,
+		auth:    auth,
+		config:  cfg,
+		stats:   stats,
+		relay:   relay,
+		onData:  onData,
+		live:    live,
+		onState: onState,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -718,6 +821,22 @@ func (w *wsListener) Start() {
 
 func (w *wsListener) Stop() {
 	w.cancel()
+}
+
+// markState reports WS-level health upward.
+//
+// Re-admitting a reconnected channel is gated on Alive(), not Healthy(): a
+// stream that is delivering validated frames is usable even if the probe is
+// being swallowed somewhere. Gating on the probe alone once kept a working
+// document out of rotation permanently.
+func (w *wsListener) markState(up bool) {
+	if w.onState == nil {
+		return
+	}
+	if up && w.live != nil && !w.live.Alive() {
+		return
+	}
+	w.onState(up)
 }
 
 func (w *wsListener) run() {
@@ -732,6 +851,9 @@ func (w *wsListener) run() {
 
 		if err := w.connect(); err != nil {
 			utils.Debugf("[VOLGA] WS error: %v", err)
+			// The push channel is gone: no packets can reach us from the peer
+			// over this document, so stop routing to it until it reconnects.
+			w.markState(false)
 		}
 		if w.ctx.Err() != nil {
 			return
@@ -786,6 +908,7 @@ func (w *wsListener) connect() error {
 	defer conn.Close()
 
 	utils.Debugf("[VOLGA] WS connected: user=%s", w.auth.UserIDStr)
+	w.markState(true)
 
 	for {
 		select {
@@ -882,6 +1005,21 @@ func (w *wsListener) handleBundleItem(raw json.RawMessage) {
 		Action string `json:"actionName"`
 	}
 	if err := json.Unmarshal(raw, &asObj); err == nil && asObj.Action != "" {
+		// Liveness control items carry no payload. Handle them before the
+		// frontier bookkeeping below, which assumes a real edit operation.
+		switch asObj.Action {
+		case probeAction:
+			if nonce, ok := parseProbeNonce(asObj.ID); ok {
+				_ = w.relay.sendProbe(pongAction, nonce)
+			}
+			return
+		case pongAction:
+			if nonce, ok := parseProbeNonce(asObj.ID); ok {
+				w.live.OnPong(nonce)
+				w.markState(true)
+			}
+			return
+		}
 		if asObj.ID != "" {
 			w.relay.SetFrontier(asObj.ID)
 		}
@@ -895,9 +1033,29 @@ func (w *wsListener) handleBundleItem(raw json.RawMessage) {
 			return
 		}
 		packets := decodeBatch(decoded)
-		w.stats.PacketsRecv.Add(uint64(len(packets)))
-		w.stats.BytesReceived.Add(uint64(len(decoded)))
+		if len(packets) == 0 {
+			return
+		}
+
+		// Keep only frames that are recognisably ours. Anything else is noise
+		// from the shared document, and it must not count as evidence that the
+		// stream is alive.
+		valid := packets[:0]
 		for _, pkt := range packets {
+			if transport.LooksLikeFrame(pkt) {
+				valid = append(valid, pkt)
+			} else {
+				w.badFrames.Add(1)
+			}
+		}
+		if len(valid) == 0 {
+			return
+		}
+
+		w.live.OnValidFrame()
+		w.stats.PacketsRecv.Add(uint64(len(valid)))
+		w.stats.BytesReceived.Add(uint64(len(decoded)))
+		for _, pkt := range valid {
 			if w.onData != nil {
 				w.onData(pkt)
 			}
@@ -905,19 +1063,28 @@ func (w *wsListener) handleBundleItem(raw json.RawMessage) {
 	}
 }
 
+// decodeBatch splits a length-prefixed batch into packets.
+//
+// Trailing bytes that do not form a complete frame are DROPPED. The previous
+// behaviour emitted them as a packet, which meant a truncated or corrupt batch
+// got injected into the gVisor stack as a bogus IP packet. Every batch this
+// transport sends is length-prefixed, so leftover bytes can only mean
+// corruption — and dropping them is safe because the inner TCP retransmits
+// whatever was lost.
 func decodeBatch(decoded []byte) [][]byte {
 	var packets [][]byte
 	for len(decoded) >= 2 {
 		ln := int(binary.BigEndian.Uint16(decoded[:2]))
 		decoded = decoded[2:]
 		if ln == 0 || len(decoded) < ln {
-			break
+			utils.Debugf("[VOLGA] truncated batch frame: dropping %d trailing bytes", len(decoded))
+			return packets
 		}
 		packets = append(packets, decoded[:ln])
 		decoded = decoded[ln:]
 	}
-	if len(packets) == 0 && len(decoded) > 0 {
-		packets = append(packets, decoded)
+	if len(decoded) > 0 {
+		utils.Debugf("[VOLGA] dropping %d stray bytes at end of batch", len(decoded))
 	}
 	return packets
 }
@@ -932,6 +1099,7 @@ type YandexVolgaTransport struct {
 	auth  *volgaAuth
 	relay *relayClient
 	ws    *wsListener
+	live  *transport.LivenessTracker
 
 	onDataMu sync.RWMutex
 	onData   func([]byte)
@@ -940,13 +1108,28 @@ type YandexVolgaTransport struct {
 }
 
 func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
-	return &YandexVolgaTransport{
+	t := &YandexVolgaTransport{
 		BaseTransport: transport.NewBaseTransport(cfg),
 		docURL:        docURL,
 		config:        DefaultVolgaConfig(),
 		stats:         &VolgaStats{},
 		keepAliveStop: make(chan struct{}),
 	}
+	if cfg.LivenessProbe {
+		t.live = transport.NewLivenessTracker(transport.DefaultProbeInterval)
+	} else {
+		t.live = transport.NewDisabledLivenessTracker()
+	}
+	return t
+}
+
+// markState is handed to the WS listener and the relay client so either half of
+// the channel can take the stream out of rotation the moment it dies. Previously
+// nothing ever cleared the connected flag after Start, so a dead document kept
+// reporting IsConnected() == true and MultiStream kept routing 1/N of the
+// traffic into it.
+func (t *YandexVolgaTransport) markState(up bool) {
+	t.SetConnected(up)
 }
 
 func (t *YandexVolgaTransport) Start() error {
@@ -961,7 +1144,7 @@ func (t *YandexVolgaTransport) Start() error {
 	}
 	t.auth = auth
 
-	t.relay = newRelayClient(auth, t.config, t.stats)
+	t.relay = newRelayClient(auth, t.config, t.stats, t.markState)
 	t.relay.Start()
 
 	t.ws = newWSListener(auth, t.config, t.stats, t.relay, func(data []byte) {
@@ -972,7 +1155,7 @@ func (t *YandexVolgaTransport) Start() error {
 			cb(data)
 		}
 		t.RecordReceive(len(data))
-	})
+	}, t.live, t.markState)
 	t.ws.Start()
 
 	go t.keepAliveLoop()
@@ -1031,8 +1214,10 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
 }
 
 func (t *YandexVolgaTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.config.KeepAliveInterval)
+	ticker := time.NewTicker(t.live.Interval())
 	defer ticker.Stop()
+
+	var suspectLogged bool
 
 	for {
 		select {
@@ -1042,10 +1227,55 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 			if !t.IsRunning() {
 				return
 			}
-			_ = t.relay.Send([]byte{0x00})
+			if t.live.Disabled() {
+				continue
+			}
+
+			// A probe replaces the old keep-alive, which sent a bare 0x00 byte.
+			// That byte was not a valid frame, so the peer's decodeBatch turned
+			// it into a bogus one-byte "packet" and injected it into gVisor.
+			if nonce := t.live.NextProbe(); nonce != 0 && t.relay != nil {
+				err := t.relay.sendProbe(probeAction, nonce)
+				t.relay.noteResult(err)
+				if err != nil {
+					utils.Debugf("[VOLGA] probe POST failed: %v", err)
+				}
+			}
+
+			// An unanswered probe is NOT treated as a dead stream — see the
+			// comment in the yandex transport for the outage this caused. A
+			// stream delivering validated frames stays usable; the probe only
+			// decides which stream MultiStream prefers.
+			if t.live.Suspect() {
+				if !suspectLogged {
+					suspectLogged = true
+					sent, misses, pongs, late := t.live.ProbeStats()
+					log.Printf("[VOLGA] probe unanswered (%d sent, %d missed, %d pongs, %d late) — "+
+						"last frame %v ago, %d frames; keeping the stream in rotation",
+						sent, misses, pongs, late,
+						t.live.RxAge().Round(time.Millisecond), t.live.ValidFrames())
+				}
+			} else {
+				suspectLogged = false
+			}
 		}
 	}
 }
+
+// Healthy implements transport.HealthReporter: the peer answered our last probe.
+func (t *YandexVolgaTransport) Healthy() bool { return t.live.Healthy() }
+
+// Alive implements transport.HealthReporter: the stream is carrying traffic,
+// by probe or by validated frames.
+func (t *YandexVolgaTransport) Alive() bool { return t.live.Alive() }
+
+// ProbeStats implements transport.HealthReporter.
+func (t *YandexVolgaTransport) ProbeStats() (sent, misses, pongs, latePongs uint64) {
+	return t.live.ProbeStats()
+}
+
+// RxAge implements transport.HealthReporter.
+func (t *YandexVolgaTransport) RxAge() time.Duration { return t.live.RxAge() }
 
 func (t *YandexVolgaTransport) statsLoop() {
 	ticker := time.NewTicker(5 * time.Second)

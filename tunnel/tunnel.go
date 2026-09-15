@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
+	"universal-bypass-tool/network"
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
 )
@@ -64,6 +66,20 @@ var (
 	TCPBufMax     = 64 * 1024 * 1024
 )
 
+// TCPMaxRetries is how many failed retransmission probes gVisor makes before it
+// aborts a connection. The gVisor default is 15, which — with exponential RTO
+// backoff — tears down every tunnelled TCP connection after roughly five to ten
+// minutes of total outage.
+//
+// The whole point of multi-stream is to survive documents dropping, so the
+// budget is raised: a long outage should slow the tunnel down, not kill every
+// connection through it. Only connections inside the tunnel are affected; the
+// exit node's real outbound connections use net.Dial, not this stack.
+var TCPMaxRetries uint64 = 64
+
+// StatsInterval is how often [STATS] is printed. Set from --stats-interval.
+var StatsInterval = 10 * time.Second
+
 // SetTCPBuffers applies the configured TCP send/receive buffer ranges to s.
 func SetTCPBuffers(s *stack.Stack) {
 	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
@@ -73,6 +89,37 @@ func SetTCPBuffers(s *stack.Stack) {
 	snd := tcpip.TCPSendBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
 		utils.Debugf("[TUNNEL] set send buffer: %v", err)
+	}
+}
+
+// SetTCPTimeouts applies the retransmission budget to s.
+func SetTCPTimeouts(s *stack.Stack) {
+	opt := tcpip.TCPMaxRetriesOption(TCPMaxRetries)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		utils.Debugf("[TUNNEL] set TCP max retries: %v", err)
+	}
+}
+
+// sendPacket hands one IP packet to the transport chain.
+//
+// When the chain is flow-aware the packet's inner TCP 4-tuple is parsed out
+// first, so MultiStream can keep the whole connection on a single document.
+// Without this the flow identity would be lost above the compression and
+// encryption layers, which is where MultiStream sits.
+//
+// Anything that cannot be attributed to one flow — ICMP, an IP fragment, a
+// truncated frame — falls through to plain Send, which uses the rotating scan.
+func sendPacket(trans transport.Transport, data []byte) {
+	if fs, flowAware := trans.(transport.FlowAwareSender); flowAware {
+		if key, parsed := network.ParseFlowKey(data); parsed {
+			if err := fs.SendFlow(key, data); err != nil {
+				utils.Debugf("[TUNNEL] trans.SendFlow error: %v", err)
+			}
+			return
+		}
+	}
+	if err := trans.Send(data); err != nil {
+		utils.Debugf("[TUNNEL] trans.Send error: %v", err)
 	}
 }
 
@@ -90,17 +137,25 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	utils.Debugf("[TUNNEL] Net stack init...")
 	t.gvisorStack = stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		// CUBIC rather than gVisor's default of Reno. The tunnel's inner TCP
+		// runs over a high-RTT, lossy relay, which is exactly the regime Reno
+		// handles worst: it halves its window on every loss and recovers
+		// slowly. CUBIC ramps back much more aggressively.
+		//
+		// Congestion control is a property of this stack and is applied
+		// per-endpoint, so this is a local choice — the peer needs no matching
+		// build and the wire format is unchanged.
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolCUBIC},
 	})
 
 	SetTCPBuffers(t.gvisorStack)
+	SetTCPTimeouts(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		if err := trans.Send(data); err != nil {
-			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
-		}
+		t.packetCount.Add(1)
+		sendPacket(trans, data)
 	}
 	t.tunnelEP = tunnelEP
 
@@ -123,7 +178,9 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 		tunnelEP.InjectInbound(data)
 	})
 
-	utils.SafeGo("tunnel.printStats", t.printStats)
+	if StatsInterval > 0 {
+		utils.SafeGo("tunnel.printStats", t.printStats)
+	}
 	return t
 }
 
@@ -201,9 +258,8 @@ func (t *TCPTunnel) setupExitNodeRaw(tunnelNIC tcpip.NICID) {
 
 	t.rawEP = rawEP
 	rawEP.SetTransportSender(func(data []byte) {
-		if err := t.transport.Send(data); err != nil {
-			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
-		}
+		t.packetCount.Add(1)
+		sendPacket(t.transport, data)
 	})
 
 	internetNIC := tcpip.NICID(2)
@@ -291,20 +347,66 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 }
 
 func (t *TCPTunnel) printStats() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(StatsInterval)
 	defer ticker.Stop()
 
+	// Counters are monotonic, but a stream that reconnects can restart its own
+	// totals; clamp so a decrease never shows up as a huge bogus rate.
+	var prevTx, prevRx, prevOut, prevRetrans uint64
+	prevAt := time.Now()
+
 	for range ticker.C {
-		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d",
+		now := time.Now()
+		elapsed := now.Sub(prevAt).Seconds()
+		if elapsed <= 0 {
+			continue
+		}
+		prevAt = now
+
+		gs := t.gvisorStack.Stats()
+		ts := t.transport.Stats()
+
+		tx, rx := ts.BytesSent, ts.BytesReceived
+		out := t.packetCount.Load()
+		retrans := gs.TCP.Retransmits.Value()
+
+		dTx := rate(tx, prevTx)
+		dRx := rate(rx, prevRx)
+		dOut := rate(out, prevOut)
+		dRetrans := rate(retrans, prevRetrans)
+
+		prevTx, prevRx, prevOut, prevRetrans = tx, rx, out, retrans
+
+		// Frames that reached the compressor but were not IPv4 packets. A
+		// steady climb here means something other than the tunnel is writing
+		// into the document.
+		var badFrames uint64
+		if ct, ok := t.transport.(*transport.CompressedTransport); ok {
+			badFrames = ct.BadFrames()
+		}
+
+		// Printed unconditionally: without --debug there was previously no way
+		// at all to see whether the tunnel was moving data.
+		log.Printf("[STATS] up=%v mode=%s est=%d out=%d/s tx=%.1fKB/s rx=%.1fKB/s retrans=+%d/%d badframe=%d",
 			time.Since(t.startTime).Round(time.Second),
 			t.exitMode.String(),
-			t.packetCount.Load(),
-			stats.TCP.CurrentConnected.Value(),
-			stats.TCP.CurrentEstablished.Value(),
-			stats.TCP.Retransmits.Value(),
+			gs.TCP.CurrentEstablished.Value(),
+			uint64(float64(dOut)/elapsed),
+			float64(dTx)/elapsed/1024,
+			float64(dRx)/elapsed/1024,
+			dRetrans,
+			retrans,
+			badFrames,
 		)
 	}
+}
+
+// rate returns cur-prev, or 0 when the counter went backwards.
+func rate(cur, prev uint64) uint64 {
+	if cur < prev {
+		return 0
+	}
+	return cur - prev
 }
 
 // ---- local IP helpers (only needed for raw mode) ----

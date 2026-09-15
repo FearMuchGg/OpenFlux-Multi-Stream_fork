@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"universal-bypass-tool/transport"
 )
 
 func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
@@ -89,4 +91,54 @@ func ParsePacketInfo(data []byte) string {
 			srcIP, srcPort, dstIP, dstPort, strings.TrimSpace(flagStr), seq, ack, window, totalLen, ttl)
 	}
 	return fmt.Sprintf("IP proto=%d %s -> %s len=%d ttl=%d", protocol, srcIP, dstIP, totalLen, ttl)
+}
+
+// ParseFlowKey extracts the inner IPv4/TCP 4-tuple from a raw IP packet, so the
+// stream-selection layer can pin a whole TCP connection to one transport
+// instead of spreading its packets round-robin.
+//
+// It reports false for anything that cannot be attributed to a single TCP flow:
+//
+//   - buffers shorter than a minimal IPv4 + TCP header;
+//   - anything that is not IPv4 (the tunnel's gVisor stack only registers
+//     ipv4 + tcp, but a corrupt frame from the transport can still land here);
+//   - non-TCP protocols (ICMP and friends must not create bogus flow entries);
+//   - IP fragments. Only the first fragment carries the TCP header, so keying
+//     fragments individually would split one datagram across streams and
+//     reorder it. Callers fall back to plain round-robin for these.
+//
+// No checksum is verified here: a malformed packet is rejected by gVisor
+// itself, and validating checksums on the hot path would cost more than the
+// misrouting it could prevent.
+func ParseFlowKey(data []byte) (transport.FlowKey, bool) {
+	if len(data) < 20 {
+		return transport.FlowKey{}, false
+	}
+	if data[0]>>4 != 4 {
+		return transport.FlowKey{}, false
+	}
+
+	ihl := int(data[0]&0x0f) * 4
+	if ihl < 20 || len(data) < ihl {
+		return transport.FlowKey{}, false
+	}
+
+	// Fragment offset (13 bits) and the more-fragments flag.
+	if data[6]&0x20 != 0 || data[6]&0x1f != 0 || data[7] != 0 {
+		return transport.FlowKey{}, false
+	}
+
+	if data[9] != 6 {
+		return transport.FlowKey{}, false
+	}
+	if len(data) < ihl+20 {
+		return transport.FlowKey{}, false
+	}
+
+	var key transport.FlowKey
+	copy(key.Src[:], data[12:16])
+	copy(key.Dst[:], data[16:20])
+	key.SrcPort = uint16(data[ihl])<<8 | uint16(data[ihl+1])
+	key.DstPort = uint16(data[ihl+2])<<8 | uint16(data[ihl+3])
+	return key, true
 }
